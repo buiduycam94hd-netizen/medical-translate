@@ -77,13 +77,27 @@ export default function Home() {
           </button>
         </div>
 
-        {/* Khu vực hiển thị kết quả bóc tách chữ */}
+        {/* Khu vực hiển thị kết quả */}
         {uploadResult && uploadResult.status === "success" && (
           <div className="mt-6 border-t pt-4">
             <p className="font-semibold text-green-600 mb-3">✓ {uploadResult.message}</p>
-            <p className="text-sm font-medium text-gray-500 mb-2">Trích xuất nội dung trang đầu tiên:</p>
-            <div className="bg-gray-100 p-4 rounded-md text-sm text-gray-800 h-64 overflow-y-auto whitespace-pre-wrap font-mono border border-gray-300">
-              {uploadResult.first_page_preview}
+            
+            <div className="grid grid-cols-2 gap-4">
+              {/* Cột Tiếng Anh */}
+              <div>
+                <p className="text-sm font-medium text-gray-500 mb-2">Bản gốc (Tiếng Anh):</p>
+                <div className="bg-gray-100 p-4 rounded-md text-sm text-gray-800 h-64 overflow-y-auto whitespace-pre-wrap font-mono border border-gray-300">
+                  {uploadResult.original_text}
+                </div>
+              </div>
+              
+              {/* Cột Tiếng Việt */}
+              <div>
+                <p className="text-sm font-medium text-blue-600 mb-2">Bản dịch (Tiếng Việt):</p>
+                <div className="bg-blue-50 p-4 rounded-md text-sm text-gray-800 h-64 overflow-y-auto whitespace-pre-wrap font-sans border border-blue-200">
+                  {uploadResult.translated_text}
+                </div>
+              </div>
             </div>
           </div>
         )}
