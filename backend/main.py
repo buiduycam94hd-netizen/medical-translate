@@ -1,134 +1,139 @@
 import os
-import logging
-import asyncio
-import base64
-import json
-from fastapi import FastAPI, UploadFile, File
+import io
+import time
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import fitz  
-from google import genai
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+import fitz  # PyMuPDF
+from PIL import Image
+from google import genai
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- THƯ VIỆN SURYA OCR ---
+from surya.ocr import run_ocr
+from surya.model.detection.segformer import load_model as load_det_model, load_processor as load_det_processor
+from surya.model.recognition.model import load_model as load_rec_model
+from surya.model.recognition.processor import load_processor as load_rec_processor
 
+# --- 1. TẢI BIẾN MÔI TRƯỜNG ---
+# Đảm bảo bạn có file .env cùng thư mục chứa dòng: GEMINI_API_KEY=mã_key_của_bạn
 load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-app = FastAPI(title="MedicalTranslate API")
+app = FastAPI(title="Hệ thống Dịch thuật Y khoa & OCR")
 
+# Cấu hình CORS để Next.js (cổng 3000) có thể gửi yêu cầu tới FastAPI (cổng 8000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"], 
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.post("/upload/")
-async def upload_pdf(file: UploadFile = File(...)):
-    async def event_generator():
-        try:
-            yield f"data: {json.dumps({'type': 'progress', 'message': 'Đang bóc tách file PDF...', 'percent': 10})}\n\n"
-            
-            file_content = await file.read()
-            doc = fitz.open(stream=file_content, filetype="pdf")
-            num_pages = len(doc)
-            
-            if num_pages == 0:
-                yield f"data: {json.dumps({'type': 'error', 'message': 'File PDF rỗng hoặc bị hỏng.'})}\n\n"
-                return
+# --- 2. KHỞI TẠO CÁC MODEL AI TOÀN CỤC ---
+print("Đang tải các mô hình AI vào bộ nhớ. Vui lòng đợi...")
 
-            full_original_text = ""
-            full_translated_text = ""
-            translated_pages_list = []
+# Tải Surya OCR (Chỉ tải 1 lần khi bật server để tối ưu tốc độ)
+print("[1/2] Đang khởi động đôi mắt AI (Surya OCR)...")
+det_processor, det_model = load_det_processor(), load_det_model()
+rec_model, rec_processor = load_rec_model(), load_rec_processor()
+
+# Khởi tạo client Gemini
+print("[2/2] Đang kết nối với não bộ trung tâm (Google Gemini)...")
+if GEMINI_API_KEY:
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    print("Tất cả hệ thống AI đã sẵn sàng hoạt động!")
+else:
+    print("CẢNH BÁO: Chưa tìm thấy GEMINI_API_KEY trong file .env")
+    gemini_client = None
+
+
+# --- 3. CÁC CỔNG GIAO TIẾP (ENDPOINTS) ---
+
+@app.post("/api/ocr")
+async def extract_text_from_image(file: UploadFile = File(...)):
+    """Đọc và bóc tách văn bản từ hình ảnh tải lên"""
+    try:
+        start_time = time.time()
+        
+        # Đọc dữ liệu ảnh
+        image_bytes = await file.read()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        
+        # Quét và bóc tách chữ (Mặc định: tiếng Anh)
+        langs = [["en"]]
+        predictions = run_ocr([image], langs, det_model, det_processor, rec_model, rec_processor)
+        
+        # Gom kết quả
+        extracted_text = "\n".join([line.text for line in predictions[0].text_lines])
+        process_time = round(time.time() - start_time, 2)
+        
+        return JSONResponse(content={
+            "status": "success", 
+            "text": extracted_text,
+            "process_time_seconds": process_time
+        })
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Lỗi xử lý ảnh: {str(e)}"}
+        )
+
+@app.post("/api/translate")
+async def translate_medical_text(text: str = Form(...)):
+    """Dịch văn bản y khoa sang tiếng Việt sử dụng Gemini"""
+    if not gemini_client:
+        raise HTTPException(status_code=500, detail="Chưa cấu hình Gemini API Key trên máy chủ.")
+        
+    try:
+        # Prompt được thiết kế chuyên sâu, chuẩn hóa thuật ngữ lâm sàng
+        system_prompt = (
+            "Bạn là một bác sĩ chuyên khoa cấp 1 Hồi sức cấp cứu (HSCC). "
+            "Hãy dịch đoạn văn bản y khoa sau sang tiếng Việt một cách chính xác, chuẩn văn phong lâm sàng tại bệnh viện Việt Nam. "
+            "Lưu ý các nguyên tắc thuật ngữ sau:\n"
+            "- Ưu tiên sử dụng 'hệ thần kinh đối giao cảm'.\n"
+            "- Giữ nguyên các ký hiệu xét nghiệm chuẩn xác như 'HBc total'.\n"
+            "- Đặc biệt chú ý độ chính xác tuyệt đối khi dịch các khái niệm về huyết động, thăng bằng kiềm toan (phương pháp Stewart), và chống độc.\n\n"
+            f"Văn bản gốc:\n{text}"
+        )
+        
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=system_prompt,
+        )
+        
+        return JSONResponse(content={
+            "status": "success",
+            "translated_text": response.text
+        })
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Lỗi dịch thuật từ AI: {str(e)}"}
+        )
+
+@app.post("/api/upload-pdf")
+async def process_pdf(file: UploadFile = File(...)):
+    """Trích xuất văn bản thô từ file PDF"""
+    try:
+        pdf_bytes = await file.read()
+        pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        full_text = ""
+        for page_num in range(len(pdf_doc)):
+            page = pdf_doc.load_page(page_num)
+            full_text += page.get_text() + "\n"
             
-            client = genai.Client(api_key=API_KEY) if API_KEY else None
-            max_pages_to_translate = min(num_pages, 3) 
-
-            for page_num in range(max_pages_to_translate):
-                percent = 10 + int((page_num / max_pages_to_translate) * 70)
-                yield f"data: {json.dumps({'type': 'progress', 'message': f'Đang dịch trang {page_num + 1}/{max_pages_to_translate}...', 'percent': percent})}\n\n"
-                
-                page_text = doc.load_page(page_num).get_text()
-                if not page_text.strip():
-                    translated_pages_list.append("")
-                    continue 
-                    
-                full_original_text += f"\n\n--- TRANG {page_num + 1} ---\n\n{page_text}"
-                
-                if client:
-                    try:
-                        response = client.models.generate_content(
-                            model="gemini-2.5-flash",
-                            contents=f"Dịch đoạn văn y khoa sau sang tiếng Việt. Chỉ trả lời bản dịch, không giải thích:\n\n{page_text}"
-                        )
-                        translated_text = response.text
-                        full_translated_text += f"\n\n--- TRANG {page_num + 1} ---\n\n{translated_text}"
-                        translated_pages_list.append(translated_text)
-                    except Exception as ai_error:
-                        logger.error(f"Lỗi ở trang {page_num + 1}: {ai_error}")
-                        err_msg = f"[Lỗi AI: {str(ai_error)}]"
-                        full_translated_text += f"\n\n--- TRANG {page_num + 1} ---\n{err_msg}"
-                        translated_pages_list.append(err_msg)
-                    
-                    if page_num < max_pages_to_translate - 1:
-                        yield f"data: {json.dumps({'type': 'progress', 'message': 'Đang tạm nghỉ 15s để làm mát hệ thống AI...', 'percent': percent + 5})}\n\n"
-                        await asyncio.sleep(15)
-                else:
-                    full_translated_text = "[Lỗi]: Chưa cấu hình API Key."
-                    translated_pages_list.append("[Lỗi]: Chưa cấu hình API Key.")
-
-            yield f"data: {json.dumps({'type': 'progress', 'message': 'Đang tạo file PDF bản dịch Tiếng Việt...', 'percent': 90})}\n\n"
-            
-            # --- THUẬT TOÁN TẠO PDF CHỐNG TRÀN CHỮ ---
-            out_pdf = fitz.open()
-            font_path = "C:/Windows/Fonts/arial.ttf" 
-            
-            for text in translated_pages_list:
-                if not text or not text.strip():
-                    text = "[Lỗi: Trang này trống dữ liệu dịch]"
-
-                fontsize = 12
-                is_fitted = False
-                
-                # Nháp: Giảm cỡ chữ dần từ 12 xuống 6
-                while fontsize >= 6:
-                    page = out_pdf.new_page()
-                    try:
-                        page.insert_font(fontname="ArialVN", fontfile=font_path)
-                        use_font = "ArialVN"
-                    except Exception:
-                        use_font = "helv" 
-                        
-                    rect = fitz.Rect(40, 40, page.rect.width - 40, page.rect.height - 40)
-                    
-                    # Hàm này trả về số < 0 nếu chữ bị tràn khỏi khung
-                    rc = page.insert_textbox(rect, text, fontsize=fontsize, fontname=use_font)
-                    
-                    if rc >= 0:
-                        is_fitted = True
-                        break # Vừa vặn, giữ nguyên trang này
-                    else:
-                        out_pdf.delete_page(page.number) # Bị tràn, xóa trang nháp làm lại
-                        fontsize -= 1
-                
-                # Nếu cỡ 6 vẫn tràn (văn bản quá dài), ép chèn vào
-                if not is_fitted:
-                    page = out_pdf.new_page()
-                    try:
-                        page.insert_font(fontname="ArialVN", fontfile=font_path)
-                    except: pass
-                    page.insert_textbox(rect, text, fontsize=6, fontname=use_font)
-                    
-            pdf_bytes = out_pdf.write()
-            pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
-
-            yield f"data: {json.dumps({'type': 'success', 'filename': file.filename, 'pages': num_pages, 'original_text': full_original_text, 'translated_text': full_translated_text, 'pdf_base64': pdf_base64, 'message': f'Đã dịch và ghép thành công {max_pages_to_translate} trang.', 'percent': 100})}\n\n"
-            
-        except Exception as e:
-            logger.error(f"Lỗi hệ thống: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Lỗi hệ thống: {str(e)}'})}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return JSONResponse(content={
+            "status": "success",
+            "extracted_text": full_text.strip()
+        })
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Lỗi đọc file PDF: {str(e)}"}
+        )
